@@ -1,542 +1,507 @@
-import json
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, JSONResponse
+import json, os, uuid
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, UploadFile, File, Header
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from database import init_db, get_db
 from auth import register_user, login_user, get_current_user
-from chats import init_chats, get_user_chats, get_chat_messages, save_message
+from chats import get_user_chats, get_chat_messages, save_message, get_all_users, create_or_get_dm
+from checklist import get_checklist, toggle_task, add_template_item, delete_template_item, reset_daily_completions, can_edit_checklist
+from news import get_events, add_event, delete_event, can_edit_news
+from tasks import can_create_tasks, get_assignable_users, create_task, get_tasks, complete_task, delete_task
+from knowledge import (can_edit_knowledge, get_cocktails, get_cocktail,
+                       add_cocktail, update_cocktail, delete_cocktail,
+                       toggle_favorite, CATEGORIES)
+from menu import (can_edit as can_edit_menu, get_menu_cocktails, get_menu_cocktail,
+                  add_menu_cocktail, update_menu_cocktail, delete_menu_cocktail,
+                  toggle_menu_favorite, MENU_CATEGORIES)
 
-app = FastAPI(title="Svoi Messenger")
+scheduler = AsyncIOScheduler()
 
-# Создаём таблицы и чаты при запуске
-init_db()
-init_chats()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    scheduler.add_job(reset_daily_completions, "cron", hour=3, minute=0)
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
+app = FastAPI(title="Svoi Bar", lifespan=lifespan)
+os.makedirs("uploads", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+MAX_FILE_SIZE = 25 * 1024 * 1024
+IMAGE_EXTENSIONS = {'.jpg','.jpeg','.png','.gif','.webp','.heic','.heif','.bmp','.svg'}
+VIDEO_EXTENSIONS = {'.mp4','.mov','.avi','.webm','.mkv'}
 
 
-# === WebSocket: хранилище активных подключений ===
 class ConnectionManager:
     def __init__(self):
         self.active: dict[int, list] = {}
+        self.online_users: set[int] = set()
 
-    async def connect(self, websocket: WebSocket, chat_id: int, user: dict):
-        await websocket.accept()
-        if chat_id not in self.active:
-            self.active[chat_id] = []
-        self.active[chat_id].append((websocket, user))
+    async def connect(self, ws: WebSocket, chat_id: int, user: dict):
+        await ws.accept()
+        if chat_id not in self.active: self.active[chat_id] = []
+        self.active[chat_id].append((ws, user))
+        self.online_users.add(user["id"])
 
-    def disconnect(self, websocket: WebSocket, chat_id: int):
+    def disconnect(self, ws: WebSocket, chat_id: int):
         if chat_id in self.active:
-            self.active[chat_id] = [
-                (ws, u) for ws, u in self.active[chat_id] if ws != websocket
-            ]
+            self.active[chat_id] = [(w, u) for w, u in self.active[chat_id] if w != ws]
+        ids = set()
+        for conns in self.active.values():
+            for _, u in conns: ids.add(u["id"])
+        self.online_users = ids
 
     async def broadcast(self, chat_id: int, message: dict):
-        if chat_id not in self.active:
-            return
-        for ws, user in self.active[chat_id]:
-            try:
-                await ws.send_json(message)
-            except:
-                pass
+        if chat_id not in self.active: return
+        for ws, _ in self.active[chat_id]:
+            try: await ws.send_json(message)
+            except: pass
 
-    def get_online_users(self, chat_id: int) -> list:
-        if chat_id not in self.active:
-            return []
+    def get_online_names(self, chat_id: int) -> list:
+        if chat_id not in self.active: return []
         return [u["display_name"] for _, u in self.active[chat_id]]
+
+    def get_online_ids(self) -> set:
+        return self.online_users
 
 
 manager = ConnectionManager()
 
 
-# === WebSocket endpoint ===
-@app.websocket("/ws/{chat_id}")
-async def websocket_endpoint(websocket: WebSocket, chat_id: int):
-    token = websocket.query_params.get("token", "")
+def _auth(request: Request) -> dict | None:
+    h = request.headers.get("Authorization", "")
+    if not h.startswith("Bearer "): return None
+    return get_current_user(h.split(" ")[1])
 
+
+# === WebSocket ===
+@app.websocket("/ws/{chat_id}")
+async def ws_endpoint(websocket: WebSocket, chat_id: int):
+    token = websocket.query_params.get("token", "")
     user = get_current_user(token)
     if not user:
-        await websocket.accept()
-        await websocket.close(code=4001)
-        return
+        await websocket.accept(); await websocket.close(code=4001); return
 
     await manager.connect(websocket, chat_id, user)
-
-    await manager.broadcast(
-        chat_id,
-        {
-            "type": "user_joined",
-            "user": user["display_name"],
-            "online": manager.get_online_users(chat_id),
-        },
-    )
+    await manager.broadcast(chat_id, {"type": "user_joined", "user": user["display_name"], "online": manager.get_online_names(chat_id)})
 
     try:
         while True:
-            data = await websocket.receive_text()
-            msg_data = json.loads(data)
-            content = msg_data.get("content", "").strip()
-
-            if not content:
+            data = json.loads(await websocket.receive_text())
+            if data.get("type") == "typing":
+                await manager.broadcast(chat_id, {"type": "typing", "user": user["display_name"], "user_id": user["id"]})
                 continue
-
+            content = data.get("content", "").strip()
+            if not content: continue
             saved = save_message(chat_id, user["id"], content)
-
-            await manager.broadcast(
-                chat_id,
-                {
-                    "type": "message",
-                    "id": saved["id"],
-                    "content": saved["content"],
-                    "user_id": saved["user_id"],
-                    "display_name": saved["display_name"],
-                    "role": saved["role"],
-                    "created_at": saved["created_at"],
-                },
-            )
-
+            await manager.broadcast(chat_id, {
+                "type": "message", "id": saved["id"], "content": saved["content"],
+                "message_type": saved["message_type"], "file_path": saved["file_path"],
+                "user_id": saved["user_id"], "display_name": saved["display_name"],
+                "role": saved["role"], "created_at": saved["created_at"],
+            })
     except WebSocketDisconnect:
         manager.disconnect(websocket, chat_id)
-        await manager.broadcast(
-            chat_id,
-            {
-                "type": "user_left",
-                "user": user["display_name"],
-                "online": manager.get_online_users(chat_id),
-            },
-        )
+        await manager.broadcast(chat_id, {"type": "user_left", "user": user["display_name"], "online": manager.get_online_names(chat_id)})
 
 
-# === API: Регистрация ===
+# === Auth ===
 @app.post("/api/register")
 async def api_register(request: Request):
     data = await request.json()
-    username = data.get("username", "").strip()
-    display_name = data.get("display_name", "").strip()
-    password = data.get("password", "")
-    role = data.get("role", "waiter")
-    venue_id = data.get("venue_id")
-
-    if not username or not display_name or not password:
-        return JSONResponse({"error": "Заполни все поля"}, status_code=400)
-
-    if len(password) < 4:
-        return JSONResponse({"error": "Пароль минимум 4 символа"}, status_code=400)
-
-    result = register_user(username, display_name, password, role, venue_id)
-    if "error" in result:
-        return JSONResponse(result, status_code=400)
-
+    u, d, p = data.get("username","").strip(), data.get("display_name","").strip(), data.get("password","")
+    if not u or not d or not p: return JSONResponse({"error": "Заполни все поля"}, status_code=400)
+    if len(p) < 4: return JSONResponse({"error": "Пароль минимум 4 символа"}, status_code=400)
+    result = register_user(u, d, p, data.get("role", "bartender"))
+    if "error" in result: return JSONResponse(result, status_code=400)
     return result
 
-
-# === API: Вход ===
 @app.post("/api/login")
 async def api_login(request: Request):
     data = await request.json()
-    username = data.get("username", "").strip()
-    password = data.get("password", "")
+    u, p = data.get("username","").strip(), data.get("password","")
+    if not u or not p: return JSONResponse({"error": "Заполни все поля"}, status_code=400)
+    result = login_user(u, p)
+    if "error" in result: return JSONResponse(result, status_code=401)
+    return result
 
-    if not username or not password:
-        return JSONResponse({"error": "Заполни все поля"}, status_code=400)
+@app.get("/api/me")
+async def api_me(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return user
 
-    result = login_user(username, password)
-    if "error" in result:
-        return JSONResponse(result, status_code=401)
+@app.get("/api/online")
+async def api_online():
+    return {"online_ids": list(manager.get_online_ids())}
 
+
+# === Chats ===
+@app.get("/api/chats")
+async def api_chats(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return get_user_chats(user["id"])
+
+@app.get("/api/chats/{chat_id}/messages")
+async def api_messages(chat_id: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return get_chat_messages(chat_id)
+
+@app.post("/api/chats/{chat_id}/upload")
+async def api_upload(chat_id: int, file: UploadFile = File(...), authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    user = get_current_user(authorization.split(" ")[1])
+    if not user: return JSONResponse({"error": "Токен недействителен"}, status_code=401)
+
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        return JSONResponse({"error": "Файл слишком большой (макс. 25 МБ)"}, status_code=400)
+
+    ext = os.path.splitext(file.filename or "file")[1].lower()
+    unique = f"uploads/{uuid.uuid4().hex[:12]}{ext}"
+    with open(unique, "wb") as f: f.write(contents)
+
+    msg_type = "image" if ext in IMAGE_EXTENSIONS else "video" if ext in VIDEO_EXTENSIONS else "file"
+    saved = save_message(chat_id, user["id"], file.filename or "file", msg_type, f"/{unique}")
+    await manager.broadcast(chat_id, {
+        "type": "message", "id": saved["id"], "content": saved["content"],
+        "message_type": saved["message_type"], "file_path": saved["file_path"],
+        "user_id": saved["user_id"], "display_name": saved["display_name"],
+        "role": saved["role"], "created_at": saved["created_at"],
+    })
+    return {"id": saved["id"], "file_path": saved["file_path"], "message_type": msg_type}
+
+
+# === Search ===
+@app.get("/api/search")
+async def api_search(request: Request, q: str = ""):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if len(q) < 2: return {"results": []}
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT m.id, m.content, m.chat_id, m.created_at, u.display_name, c.name as chat_name
+        FROM messages m JOIN users u ON u.id = m.user_id JOIN chats c ON c.id = m.chat_id
+        WHERE m.content LIKE ? AND m.message_type = 'text' ORDER BY m.created_at DESC LIMIT 30
+    """, (f"%{q}%",)).fetchall()
+    conn.close()
+    return {"results": [dict(r) for r in rows]}
+
+
+# === Pins ===
+@app.get("/api/chats/{chat_id}/pins")
+async def api_pins(chat_id: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT m.id, m.content, m.message_type, m.created_at, u.display_name
+        FROM pinned_messages p JOIN messages m ON m.id = p.message_id JOIN users u ON u.id = m.user_id
+        WHERE p.chat_id = ? ORDER BY p.pinned_at DESC
+    """, (chat_id,)).fetchall()
+    conn.close()
+    return {"pins": [dict(r) for r in rows]}
+
+@app.post("/api/chats/{chat_id}/pin/{message_id}")
+async def api_pin(chat_id: int, message_id: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    conn = get_db()
+    conn.execute("INSERT OR IGNORE INTO pinned_messages (chat_id, message_id, pinned_by) VALUES (?, ?, ?)", (chat_id, message_id, user["id"]))
+    conn.commit(); conn.close()
+    return {"pinned": True}
+
+@app.delete("/api/chats/{chat_id}/pin/{message_id}")
+async def api_unpin(chat_id: int, message_id: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    conn = get_db()
+    conn.execute("DELETE FROM pinned_messages WHERE chat_id = ? AND message_id = ?", (chat_id, message_id))
+    conn.commit(); conn.close()
+    return {"unpinned": True}
+
+
+# === DM ===
+@app.get("/api/users")
+async def api_users(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return get_all_users(exclude_id=user["id"])
+
+@app.post("/api/dm")
+async def api_dm(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    data = await request.json()
+    uid = data.get("user_id")
+    if not uid: return JSONResponse({"error": "user_id обязателен"}, status_code=400)
+    result = create_or_get_dm(user["id"], uid)
+    if "error" in result: return JSONResponse(result, status_code=400)
     return result
 
 
-# === API: Текущий пользователь ===
-@app.get("/api/me")
-async def api_me(request: Request):
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+# === Checklist ===
+@app.get("/api/checklist")
+async def api_checklist(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    data = get_checklist()
+    data["can_edit"] = can_edit_checklist(user["role"])
+    return data
+
+@app.post("/api/checklist/toggle")
+async def api_cl_toggle(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    data = await request.json()
+    result = toggle_task(data.get("template_id"), user["id"])
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.post("/api/checklist/template")
+async def api_cl_add(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_checklist(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    data = await request.json()
+    result = add_template_item(data.get("section","opening"), data.get("title",""), data.get("detail",""))
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.delete("/api/checklist/template/{tid}")
+async def api_cl_del(tid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_checklist(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    result = delete_template_item(tid)
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+
+# === News ===
+@app.get("/api/events")
+async def api_events(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return {"events": get_events(), "can_edit": can_edit_news(user["role"])}
+
+@app.post("/api/events")
+async def api_add_event(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_news(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    d = await request.json()
+    result = add_event(d.get("event_date",""), d.get("event_time","20:00"), d.get("title",""), d.get("description",""), d.get("genre",""), d.get("entry_fee",""))
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.delete("/api/events/{eid}")
+async def api_del_event(eid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_news(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    result = delete_event(eid)
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+
+# === Tasks ===
+@app.get("/api/tasks")
+async def api_tasks(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return {"tasks": get_tasks(user), "can_create": can_create_tasks(user["role"])}
+
+@app.get("/api/tasks/users")
+async def api_task_users(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_create_tasks(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    return get_assignable_users(user)
+
+@app.post("/api/tasks")
+async def api_create_task(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_create_tasks(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    d = await request.json()
+    result = create_task(d.get("title",""), user["id"], d.get("assigned_to"), d.get("detail",""), d.get("priority","normal"), d.get("deadline",""))
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.post("/api/tasks/{tid}/toggle")
+async def api_task_toggle(tid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    result = complete_task(tid, user["id"])
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.delete("/api/tasks/{tid}")
+async def api_task_del(tid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    result = delete_task(tid, user["id"])
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+
+# === Knowledge (Cocktail Tech Cards) ===
+@app.get("/api/cocktails")
+async def api_cocktails(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return {
+        "cocktails": get_cocktails(user["id"]),
+        "can_edit": can_edit_knowledge(user["role"]),
+        "categories": CATEGORIES,
+    }
+
+@app.get("/api/cocktails/{cid}")
+async def api_cocktail(cid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    c = get_cocktail(cid, user["id"])
+    if not c: return JSONResponse({"error": "Не найден"}, status_code=404)
+    return c
+
+@app.post("/api/cocktails")
+async def api_add_cocktail(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_knowledge(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    d = await request.json()
+    result = add_cocktail(
+        name=d.get("name",""), glass=d.get("glass",""), garnish=d.get("garnish",""),
+        method=d.get("method",""), ingredients=d.get("ingredients",[]),
+        instructions=d.get("instructions",""), created_by=user["id"],
+        photo_path=d.get("photo_path",""), category=d.get("category","Классика"),
+    )
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.put("/api/cocktails/{cid}")
+async def api_update_cocktail(cid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_knowledge(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    d = await request.json()
+    result = update_cocktail(
+        cid,
+        name=d.get("name"), glass=d.get("glass"), garnish=d.get("garnish"),
+        method=d.get("method"), ingredients=d.get("ingredients"),
+        instructions=d.get("instructions"), category=d.get("category"),
+    )
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.post("/api/cocktails/{cid}/favorite")
+async def api_toggle_favorite(cid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return toggle_favorite(user["id"], cid)
+
+@app.post("/api/cocktails/{cid}/photo")
+async def api_cocktail_photo(cid: int, file: UploadFile = File(...), authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
         return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    user = get_current_user(authorization.split(" ")[1])
+    if not user: return JSONResponse({"error": "Токен недействителен"}, status_code=401)
+    if not can_edit_knowledge(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
 
-    token = auth_header.split(" ")[1]
-    user = get_current_user(token)
-    if not user:
-        return JSONResponse({"error": "Токен недействителен"}, status_code=401)
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        return JSONResponse({"error": "Файл слишком большой"}, status_code=400)
+    ext = os.path.splitext(file.filename or "photo.jpg")[1].lower()
+    unique = f"uploads/cocktail_{cid}_{uuid.uuid4().hex[:8]}{ext}"
+    with open(unique, "wb") as f: f.write(contents)
+    update_cocktail(cid, photo_path=f"/{unique}")
+    return {"photo_path": f"/{unique}"}
 
-    return user
+@app.delete("/api/cocktails/{cid}")
+async def api_del_cocktail(cid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_knowledge(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    result = delete_cocktail(cid)
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
 
 
-# === API: Список заведений ===
-@app.get("/api/venues")
-async def api_venues():
-    conn = get_db()
-    venues = conn.execute("SELECT id, name, emoji FROM venues").fetchall()
-    conn.close()
-    return [dict(v) for v in venues]
 
 
-# === API: Мои чаты ===
-@app.get("/api/chats")
-async def api_chats(request: Request):
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
+# === Menu Cocktails ===
+@app.get("/api/menu")
+async def api_menu(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return {"cocktails": get_menu_cocktails(user["id"]), "can_edit": can_edit_menu(user["role"]), "categories": MENU_CATEGORIES}
+
+@app.post("/api/menu")
+async def api_add_menu(request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_menu(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    d = await request.json()
+    result = add_menu_cocktail(
+        name=d.get("name",""), glass=d.get("glass",""), garnish=d.get("garnish",""),
+        method=d.get("method",""), ingredients=d.get("ingredients",[]),
+        instructions=d.get("instructions",""), created_by=user["id"],
+        photo_path=d.get("photo_path",""), category=d.get("category","Классика из меню"),
+    )
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.put("/api/menu/{cid}")
+async def api_update_menu(cid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_menu(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    d = await request.json()
+    result = update_menu_cocktail(cid, name=d.get("name"), glass=d.get("glass"), garnish=d.get("garnish"),
+        method=d.get("method"), ingredients=d.get("ingredients"), instructions=d.get("instructions"), category=d.get("category"))
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
+
+@app.post("/api/menu/{cid}/favorite")
+async def api_menu_favorite(cid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    return toggle_menu_favorite(user["id"], cid)
+
+@app.post("/api/menu/{cid}/photo")
+async def api_menu_photo(cid: int, file: UploadFile = File(...), authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
         return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    user = get_current_user(authorization.split(" ")[1])
+    if not user: return JSONResponse({"error": "Токен недействителен"}, status_code=401)
+    if not can_edit_menu(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE: return JSONResponse({"error": "Файл слишком большой"}, status_code=400)
+    ext = os.path.splitext(file.filename or "photo.jpg")[1].lower()
+    unique = f"uploads/menu_{cid}_{uuid.uuid4().hex[:8]}{ext}"
+    with open(unique, "wb") as f: f.write(contents)
+    update_menu_cocktail(cid, photo_path=f"/{unique}")
+    return {"photo_path": f"/{unique}"}
 
-    token = auth_header.split(" ")[1]
-    user = get_current_user(token)
-    if not user:
-        return JSONResponse({"error": "Токен недействителен"}, status_code=401)
+@app.delete("/api/menu/{cid}")
+async def api_del_menu(cid: int, request: Request):
+    user = _auth(request)
+    if not user: return JSONResponse({"error": "Не авторизован"}, status_code=401)
+    if not can_edit_menu(user["role"]): return JSONResponse({"error": "Нет прав"}, status_code=403)
+    result = delete_menu_cocktail(cid)
+    if "error" in result: return JSONResponse(result, status_code=400)
+    return result
 
-    chats = get_user_chats(user["id"])
-    return chats
-
-
-# === API: Сообщения чата ===
-@app.get("/api/chats/{chat_id}/messages")
-async def api_chat_messages(chat_id: int, request: Request):
-    auth_header = request.headers.get("Authorization", "")
-    if not auth_header.startswith("Bearer "):
-        return JSONResponse({"error": "Не авторизован"}, status_code=401)
-
-    token = auth_header.split(" ")[1]
-    user = get_current_user(token)
-    if not user:
-        return JSONResponse({"error": "Токен недействителен"}, status_code=401)
-
-    messages = get_chat_messages(chat_id)
-    return messages
-
-
-# === Главная страница — мессенджер ===
+# === Home ===
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        <title>Svoi Messenger</title>
-        <style>
-            * { margin: 0; padding: 0; box-sizing: border-box; }
-            body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0c0a15; color: #e2e8f0; height: 100vh; overflow: hidden; }
-
-            #authScreen { display: flex; align-items: center; justify-content: center; height: 100vh; }
-            .auth-container { width: 100%; max-width: 380px; padding: 24px; }
-            .logo { text-align: center; margin-bottom: 32px; }
-            .logo .icon { font-size: 48px; }
-            .logo h1 { font-size: 24px; margin-top: 8px; }
-            .logo h1 span { color: #f59e0b; }
-            .logo p { color: #7c7a9a; font-size: 13px; margin-top: 4px; }
-
-            .tabs { display: flex; gap: 4px; margin-bottom: 24px; background: #1e1838; border-radius: 10px; padding: 4px; }
-            .tab { flex: 1; padding: 10px; text-align: center; border: none; background: transparent; color: #7c7a9a; font-size: 14px; font-weight: 700; border-radius: 8px; cursor: pointer; font-family: inherit; }
-            .tab.active { background: #2a2248; color: #f59e0b; }
-
-            .form { display: flex; flex-direction: column; gap: 12px; }
-            .form.hidden { display: none; }
-            .input { padding: 12px 16px; background: #16122a; border: 1.5px solid #2a2248; border-radius: 10px; color: #e2e8f0; font-size: 14px; outline: none; font-family: inherit; }
-            .input:focus { border-color: #f59e0b; }
-            .input::placeholder { color: #4a4568; }
-            select.input { cursor: pointer; }
-            select.input option { background: #16122a; color: #e2e8f0; }
-
-            .btn { padding: 12px; background: #f59e0b; color: #0c0a15; border: none; border-radius: 10px; font-size: 15px; font-weight: 700; cursor: pointer; font-family: inherit; }
-            .btn:hover { opacity: 0.9; }
-            .error-msg { background: rgba(248,113,113,0.1); color: #f87171; padding: 10px 14px; border-radius: 8px; font-size: 13px; display: none; }
-
-            #messengerScreen { display: none; height: 100vh; }
-            .msg-layout { display: flex; height: 100vh; }
-
-            .sidebar { width: 280px; background: #16122a; border-right: 1px solid #2a2248; display: flex; flex-direction: column; flex-shrink: 0; }
-            .sidebar-header { padding: 16px; border-bottom: 1px solid #2a2248; display: flex; align-items: center; justify-content: space-between; }
-            .sidebar-title { font-weight: 800; font-size: 16px; }
-            .sidebar-user { font-size: 11px; color: #f59e0b; }
-            .logout-btn-small { background: none; border: 1px solid #2a2248; color: #7c7a9a; padding: 4px 10px; border-radius: 6px; font-size: 11px; cursor: pointer; font-family: inherit; }
-            .logout-btn-small:hover { border-color: #f87171; color: #f87171; }
-
-            .chat-list { flex: 1; overflow-y: auto; padding: 8px; }
-            .chat-list-section { font-size: 10px; color: #7c7a9a; text-transform: uppercase; letter-spacing: 1.5px; padding: 12px 8px 4px; font-weight: 700; }
-
-            .chat-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; display: flex; align-items: center; gap: 10px; transition: background 0.15s; margin-bottom: 2px; }
-            .chat-item:hover { background: #1e1838; }
-            .chat-item.active { background: #2a2248; }
-            .chat-emoji { font-size: 18px; width: 32px; height: 32px; background: #1e1838; border-radius: 8px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
-            .chat-item.active .chat-emoji { background: #362e5c; }
-            .chat-name { font-size: 13px; font-weight: 600; }
-
-            .chat-area { flex: 1; display: flex; flex-direction: column; }
-            .chat-header { padding: 14px 20px; border-bottom: 1px solid #2a2248; background: #16122a; display: flex; align-items: center; justify-content: space-between; }
-            .chat-header-title { font-weight: 800; font-size: 16px; }
-            .chat-header-online { font-size: 12px; color: #34d399; }
-
-            .chat-no-select { flex: 1; display: flex; align-items: center; justify-content: center; color: #4a4568; font-size: 15px; }
-
-            .messages-area { flex: 1; overflow-y: auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 8px; }
-
-            .msg-bubble { max-width: 75%; padding: 10px 14px; border-radius: 14px; font-size: 14px; line-height: 1.4; animation: fadeIn 0.2s ease; }
-            .msg-bubble.other { background: #1e1838; align-self: flex-start; border-bottom-left-radius: 4px; }
-            .msg-bubble.mine { background: #3b2f63; align-self: flex-end; border-bottom-right-radius: 4px; }
-            .msg-author { font-size: 11px; font-weight: 700; color: #f59e0b; margin-bottom: 2px; }
-            .msg-time { font-size: 10px; color: #7c7a9a; margin-top: 4px; text-align: right; }
-
-            @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
-
-            .input-area { padding: 12px 16px; border-top: 1px solid #2a2248; background: #16122a; display: flex; gap: 10px; }
-            .msg-input { flex: 1; padding: 10px 16px; background: #0c0a15; border: 1.5px solid #2a2248; border-radius: 10px; color: #e2e8f0; font-size: 14px; outline: none; font-family: inherit; }
-            .msg-input:focus { border-color: #f59e0b; }
-            .send-btn { padding: 10px 18px; background: #f59e0b; color: #0c0a15; border: none; border-radius: 10px; font-weight: 700; cursor: pointer; font-family: inherit; font-size: 14px; }
-            .send-btn:hover { opacity: 0.9; }
-
-            @media (max-width: 600px) {
-                .sidebar { position: absolute; z-index: 10; width: 100%; transform: translateX(0); transition: transform 0.3s; }
-                .sidebar.hidden { transform: translateX(-100%); }
-                .chat-area { width: 100%; }
-                .mobile-back { display: inline-block; cursor: pointer; margin-right: 8px; font-size: 18px; }
-            }
-            @media (min-width: 601px) {
-                .mobile-back { display: none; }
-            }
-        </style>
-    </head>
-    <body>
-
-    <div id="authScreen">
-        <div class="auth-container">
-            <div class="logo">
-                <div class="icon">🍸</div>
-                <h1>Svoi <span>Messenger</span></h1>
-                <p>Свои · Натуралист</p>
-            </div>
-            <div class="tabs">
-                <button class="tab active" onclick="switchTab('login')">Вход</button>
-                <button class="tab" onclick="switchTab('register')">Регистрация</button>
-            </div>
-            <div id="error" class="error-msg"></div>
-            <div id="loginForm" class="form">
-                <input class="input" id="loginUsername" placeholder="Логин">
-                <input class="input" id="loginPassword" type="password" placeholder="Пароль">
-                <button class="btn" onclick="doLogin()">Войти</button>
-            </div>
-            <div id="registerForm" class="form hidden">
-                <input class="input" id="regUsername" placeholder="Логин (латиница)">
-                <input class="input" id="regDisplayName" placeholder="Имя (как видят другие)">
-                <input class="input" id="regPassword" type="password" placeholder="Пароль (мин. 4 символа)">
-                <select class="input" id="regVenue"><option value="">Загрузка...</option></select>
-                <select class="input" id="regRole">
-                    <option value="owner">Руководство</option>
-                    <option value="bar_manager">Бар-менеджер</option>
-                    <option value="head_chef">Шеф-повар</option>
-                    <option value="senior_bartender">Старший бармен</option>
-                    <option value="cook">Повар</option>
-                    <option value="bartender">Бармен</option>
-                    <option value="waiter">Официант</option>
-                </select>
-                <button class="btn" onclick="doRegister()">Зарегистрироваться</button>
-            </div>
-        </div>
-    </div>
-
-    <div id="messengerScreen">
-        <div class="msg-layout">
-            <div class="sidebar" id="sidebar">
-                <div class="sidebar-header">
-                    <div>
-                        <div class="sidebar-title">🍸 Svoi</div>
-                        <div class="sidebar-user" id="sidebarUser"></div>
-                    </div>
-                    <button class="logout-btn-small" onclick="doLogout()">Выйти</button>
-                </div>
-                <div class="chat-list" id="chatList"></div>
-            </div>
-            <div class="chat-area" id="chatArea">
-                <div class="chat-no-select" id="noChat">← Выбери чат</div>
-                <div id="activeChatView" style="display:none; flex-direction:column; height:100%;">
-                    <div class="chat-header">
-                        <div>
-                            <span class="mobile-back" onclick="showSidebar()">←</span>
-                            <span class="chat-header-title" id="chatHeaderTitle"></span>
-                        </div>
-                        <div class="chat-header-online" id="chatOnline"></div>
-                    </div>
-                    <div class="messages-area" id="messagesArea"></div>
-                    <div class="input-area">
-                        <input class="msg-input" id="msgInput" placeholder="Сообщение..." onkeydown="if(event.key==='Enter')sendMessage()">
-                        <button class="send-btn" onclick="sendMessage()">→</button>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script>
-    let currentToken = localStorage.getItem('token');
-    let currentUser = null;
-    let currentChatId = null;
-    let ws = null;
-
-    const roleNames = {owner:'Руководство', bar_manager:'Бар-менеджер', head_chef:'Шеф-повар', senior_bartender:'Старший бармен', cook:'Повар', bartender:'Бармен', waiter:'Официант'};
-
-    async function loadVenues() {
-        const res = await fetch('/api/venues');
-        const venues = await res.json();
-        const select = document.getElementById('regVenue');
-        select.innerHTML = '<option value="">Оба заведения</option>';
-        venues.forEach(v => { select.innerHTML += `<option value="${v.id}">${v.emoji} ${v.name}</option>`; });
-    }
-
-    function switchTab(tab) {
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        event.target.classList.add('active');
-        document.getElementById('loginForm').classList.toggle('hidden', tab !== 'login');
-        document.getElementById('registerForm').classList.toggle('hidden', tab !== 'register');
-        document.getElementById('error').style.display = 'none';
-    }
-
-    function showError(msg) {
-        const el = document.getElementById('error');
-        el.textContent = msg;
-        el.style.display = 'block';
-    }
-
-    async function doLogin() {
-        const username = document.getElementById('loginUsername').value;
-        const password = document.getElementById('loginPassword').value;
-        const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, password}) });
-        const data = await res.json();
-        if (data.error) { showError(data.error); return; }
-        localStorage.setItem('token', data.token);
-        currentToken = data.token;
-        currentUser = data;
-        enterMessenger();
-    }
-
-    async function doRegister() {
-        const username = document.getElementById('regUsername').value;
-        const display_name = document.getElementById('regDisplayName').value;
-        const password = document.getElementById('regPassword').value;
-        const venue_id = document.getElementById('regVenue').value || null;
-        const role = document.getElementById('regRole').value;
-        const res = await fetch('/api/register', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username, display_name, password, venue_id, role}) });
-        const data = await res.json();
-        if (data.error) { showError(data.error); return; }
-        localStorage.setItem('token', data.token);
-        currentToken = data.token;
-        currentUser = data;
-        enterMessenger();
-    }
-
-    function doLogout() {
-        localStorage.removeItem('token');
-        currentToken = null;
-        currentUser = null;
-        if (ws) ws.close();
-        document.getElementById('authScreen').style.display = 'flex';
-        document.getElementById('messengerScreen').style.display = 'none';
-    }
-
-    async function enterMessenger() {
-        if (!currentUser || !currentUser.display_name) {
-            const res = await fetch('/api/me', { headers: {'Authorization': 'Bearer ' + currentToken} });
-            if (!res.ok) { doLogout(); return; }
-            currentUser = await res.json();
-        }
-        document.getElementById('authScreen').style.display = 'none';
-        document.getElementById('messengerScreen').style.display = 'block';
-        document.getElementById('sidebarUser').textContent = currentUser.display_name + ' · ' + (roleNames[currentUser.role] || currentUser.role);
-        await loadChats();
-    }
-
-    async function loadChats() {
-        const res = await fetch('/api/chats', { headers: {'Authorization': 'Bearer ' + currentToken} });
-        const chats = await res.json();
-        const list = document.getElementById('chatList');
-        list.innerHTML = '';
-
-        const groups = { general: [], svoi: [], nat: [], service: [] };
-        chats.forEach(c => {
-            if (c.category === 'announcement') groups.service.push(c);
-            else if (c.category === 'general' || c.category === 'management') groups.general.push(c);
-            else if (c.category === 'venue_general' && c.venue_id) {
-                if (c.venue_emoji === '🌿') groups.nat.push(c);
-                else groups.svoi.push(c);
-            }
-            else if (c.venue_emoji === '🌿') groups.nat.push(c);
-            else if (c.venue_emoji === '🍸') groups.svoi.push(c);
-            else groups.general.push(c);
-        });
-
-        function addSection(title, items) {
-            if (items.length === 0) return;
-            list.innerHTML += `<div class="chat-list-section">${title}</div>`;
-            items.forEach(c => {
-                const emoji = c.is_announcement ? '📢' : (c.venue_emoji || '💬');
-                list.innerHTML += `<div class="chat-item" data-id="${c.id}" onclick="openChat(${c.id}, '${c.name.replace(/'/g, "\\'")}')"><div class="chat-emoji">${emoji}</div><div class="chat-name">${c.name}</div></div>`;
-            });
-        }
-
-        addSection('Общие', groups.general);
-        addSection('🍸 Свои', groups.svoi);
-        addSection('🌿 Натуралист', groups.nat);
-        addSection('Сервисные', groups.service);
-    }
-
-    async function openChat(chatId, chatName) {
-        currentChatId = chatId;
-        document.querySelectorAll('.chat-item').forEach(el => el.classList.remove('active'));
-        document.querySelector(`.chat-item[data-id="${chatId}"]`)?.classList.add('active');
-        document.getElementById('noChat').style.display = 'none';
-        document.getElementById('activeChatView').style.display = 'flex';
-        document.getElementById('chatHeaderTitle').textContent = chatName;
-        document.getElementById('sidebar').classList.add('hidden');
-
-        const res = await fetch(`/api/chats/${chatId}/messages`, { headers: {'Authorization': 'Bearer ' + currentToken} });
-        const messages = await res.json();
-        const area = document.getElementById('messagesArea');
-        area.innerHTML = '';
-        messages.forEach(m => appendMessage(m));
-        area.scrollTop = area.scrollHeight;
-        connectWS(chatId);
-    }
-
-    function connectWS(chatId) {
-        if (ws) ws.close();
-        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-        ws = new WebSocket(`${protocol}//${location.host}/ws/${chatId}?token=${currentToken}`);
-
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            if (data.type === 'message') {
-                appendMessage(data);
-                document.getElementById('messagesArea').scrollTop = document.getElementById('messagesArea').scrollHeight;
-            }
-            else if (data.type === 'user_joined' || data.type === 'user_left') {
-                document.getElementById('chatOnline').textContent = data.online.length + ' онлайн';
-            }
-        };
-        ws.onclose = () => {};
-    }
-
-    function appendMessage(msg) {
-        const area = document.getElementById('messagesArea');
-        const isMine = msg.user_id === currentUser.user_id || msg.user_id === currentUser.id;
-        const time = msg.created_at ? msg.created_at.split(' ')[1]?.substring(0,5) || '' : '';
-        const div = document.createElement('div');
-        div.className = `msg-bubble ${isMine ? 'mine' : 'other'}`;
-        div.innerHTML = `${!isMine ? `<div class="msg-author">${msg.display_name}</div>` : ''}<div>${msg.content}</div><div class="msg-time">${time}</div>`;
-        area.appendChild(div);
-    }
-
-    function sendMessage() {
-        const input = document.getElementById('msgInput');
-        const text = input.value.trim();
-        if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
-        ws.send(JSON.stringify({ content: text }));
-        input.value = '';
-        input.focus();
-    }
-
-    function showSidebar() {
-        document.getElementById('sidebar').classList.remove('hidden');
-    }
-
-    loadVenues();
-    if (currentToken) { enterMessenger(); }
-    </script>
-    </body>
-    </html>
-    """
+    return FileResponse("static/index.html")
