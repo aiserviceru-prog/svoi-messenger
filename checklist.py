@@ -13,20 +13,25 @@ def get_checklist(for_date: str = None) -> dict:
         for_date = date.today().isoformat()
 
     conn = get_db()
-    rows = conn.execute("""
+    rows = conn.execute(
+        """
         SELECT t.id, t.section, t.title, t.detail, t.sort_order,
                c.completed_by, c.completed_at, u.display_name as completed_by_name
         FROM checklist_templates t
         LEFT JOIN checklist_completions c ON c.template_id = t.id AND c.completed_date = ?
         LEFT JOIN users u ON u.id = c.completed_by
         WHERE t.is_active = 1 ORDER BY t.section, t.sort_order
-    """, (for_date,)).fetchall()
+    """,
+        (for_date,),
+    ).fetchall()
     conn.close()
 
     sections = {"opening": [], "during": [], "closing": []}
     for r in rows:
         item = {
-            "id": r["id"], "title": r["title"], "detail": r["detail"] or "",
+            "id": r["id"],
+            "title": r["title"],
+            "detail": r["detail"] or "",
             "done": r["completed_by"] is not None,
             "completed_by_name": r["completed_by_name"] or "",
             "completed_at": r["completed_at"] or "",
@@ -44,7 +49,10 @@ def toggle_task(template_id: int, user_id: int, for_date: str = None) -> dict:
         for_date = date.today().isoformat()
 
     conn = get_db()
-    if not conn.execute("SELECT id FROM checklist_templates WHERE id = ? AND is_active = 1", (template_id,)).fetchone():
+    if not conn.execute(
+        "SELECT id FROM checklist_templates WHERE id = ? AND is_active = 1",
+        (template_id,),
+    ).fetchone():
         conn.close()
         return {"error": "Пункт не найден"}
 
@@ -54,7 +62,9 @@ def toggle_task(template_id: int, user_id: int, for_date: str = None) -> dict:
     ).fetchone()
 
     if existing:
-        conn.execute("DELETE FROM checklist_completions WHERE id = ?", (existing["id"],))
+        conn.execute(
+            "DELETE FROM checklist_completions WHERE id = ?", (existing["id"],)
+        )
         conn.commit()
         conn.close()
         return {"done": False, "template_id": template_id}
@@ -65,9 +75,16 @@ def toggle_task(template_id: int, user_id: int, for_date: str = None) -> dict:
             (template_id, for_date, user_id, now),
         )
         conn.commit()
-        user = conn.execute("SELECT display_name FROM users WHERE id = ?", (user_id,)).fetchone()
+        user = conn.execute(
+            "SELECT display_name FROM users WHERE id = ?", (user_id,)
+        ).fetchone()
         conn.close()
-        return {"done": True, "template_id": template_id, "completed_by_name": user["display_name"] if user else "", "completed_at": now}
+        return {
+            "done": True,
+            "template_id": template_id,
+            "completed_by_name": user["display_name"] if user else "",
+            "completed_at": now,
+        }
 
 
 def add_template_item(section: str, title: str, detail: str = "") -> dict:
@@ -87,15 +104,26 @@ def add_template_item(section: str, title: str, detail: str = "") -> dict:
     )
     conn.commit()
     conn.close()
-    return {"id": cursor.lastrowid, "section": section, "title": title.strip(), "detail": detail.strip(), "sort_order": max_order + 1}
+    return {
+        "id": cursor.lastrowid,
+        "section": section,
+        "title": title.strip(),
+        "detail": detail.strip(),
+        "sort_order": max_order + 1,
+    }
 
 
 def delete_template_item(template_id: int) -> dict:
     conn = get_db()
-    if not conn.execute("SELECT id FROM checklist_templates WHERE id = ? AND is_active = 1", (template_id,)).fetchone():
+    if not conn.execute(
+        "SELECT id FROM checklist_templates WHERE id = ? AND is_active = 1",
+        (template_id,),
+    ).fetchone():
         conn.close()
         return {"error": "Пункт не найден"}
-    conn.execute("UPDATE checklist_templates SET is_active = 0 WHERE id = ?", (template_id,))
+    conn.execute(
+        "UPDATE checklist_templates SET is_active = 0 WHERE id = ?", (template_id,)
+    )
     conn.commit()
     conn.close()
     return {"deleted": True, "template_id": template_id}

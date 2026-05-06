@@ -13,7 +13,8 @@ def get_db():
 
 def init_db():
     conn = get_db()
-    conn.executescript("""
+    conn.executescript(
+        """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT NOT NULL UNIQUE,
@@ -162,34 +163,32 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id),
             FOREIGN KEY (cocktail_id) REFERENCES menu_cocktails(id) ON DELETE CASCADE
         );
-    """)
+    """
+    )
 
     # Создаём основной чат
-    existing = conn.execute("SELECT COUNT(*) FROM chats WHERE chat_type='group'").fetchone()[0]
+    existing = conn.execute(
+        "SELECT COUNT(*) FROM chats WHERE chat_type='group'"
+    ).fetchone()[0]
     if existing == 0:
-        conn.execute("INSERT INTO chats (name, chat_type) VALUES ('Бар Свои Чатик', 'group')")
+        conn.execute(
+            "INSERT INTO chats (name, chat_type) VALUES ('Бар Свои Чатик', 'group')"
+        )
         conn.commit()
         print("✅ Чат «Бар Свои Чатик» создан")
-
-    # Шаблон чек-листа
-    existing_cl = conn.execute("SELECT COUNT(*) FROM checklist_templates").fetchone()[0]
-    if existing_cl == 0:
-        _init_checklist(conn)
-
-    # Демо-события
-    existing_ev = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
-    if existing_ev == 0:
-        _init_events(conn)
 
     # Миграция: добавить колонку category если её нет
     cols = [row[1] for row in conn.execute("PRAGMA table_info(cocktails)").fetchall()]
     if "category" not in cols:
-        conn.execute("ALTER TABLE cocktails ADD COLUMN category TEXT DEFAULT 'Классика'")
+        conn.execute(
+            "ALTER TABLE cocktails ADD COLUMN category TEXT DEFAULT 'Классика'"
+        )
         conn.commit()
         print("✅ Миграция: добавлена колонка category")
 
     # Миграция: таблица избранного
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS cocktail_favorites (
             user_id INTEGER NOT NULL,
             cocktail_id INTEGER NOT NULL,
@@ -198,11 +197,13 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id),
             FOREIGN KEY (cocktail_id) REFERENCES cocktails(id) ON DELETE CASCADE
         )
-    """)
+    """
+    )
     conn.commit()
 
     # Миграция: таблицы меню коктейлей
-    conn.execute("""
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS menu_cocktails (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -217,8 +218,10 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (created_by) REFERENCES users(id)
         )
-    """)
-    conn.execute("""
+    """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS menu_cocktail_favorites (
             user_id INTEGER NOT NULL,
             cocktail_id INTEGER NOT NULL,
@@ -227,57 +230,9 @@ def init_db():
             FOREIGN KEY (user_id) REFERENCES users(id),
             FOREIGN KEY (cocktail_id) REFERENCES menu_cocktails(id) ON DELETE CASCADE
         )
-    """)
+    """
+    )
     conn.commit()
 
     conn.close()
     print("✅ База данных готова")
-
-
-def _init_checklist(conn):
-    tasks = [
-        ("opening", "Включить свет, музыку, вентиляцию", "", 1),
-        ("opening", "Проверить чистоту барной стойки", "Протереть стойку, полки, зеркала", 2),
-        ("opening", "Проверить стоп-лист и наличие продуктов", "Сиропы, фрукты, лёд, гарниры", 3),
-        ("opening", "Подготовить кассу, проверить размен", "", 4),
-        ("opening", "Выложить меню / тейбл-тенты", "", 5),
-        ("opening", "Фото барной стойки в чат", "Сфоткать готовую стойку и отправить", 6),
-        ("during", "Проверить наличие льда и гарниров", "Лимон, лайм, мята, ягоды", 1),
-        ("during", "Протереть стойку и рабочую зону", "", 2),
-        ("during", "Обновить стоп-лист (если есть изменения)", "Написать в чат", 3),
-        ("during", "Пополнить холодильник напитками", "", 4),
-        ("during", "Фото витрины в чат", "Фото в разгар работы", 5),
-        ("closing", "Последний заказ объявлен", "", 1),
-        ("closing", "Закрыть кассу, снять Z-отчёт", "", 2),
-        ("closing", "Помыть барное оборудование", "Кофемашина, блендер, шейкеры", 3),
-        ("closing", "Убрать стойку, помыть инвентарь", "", 4),
-        ("closing", "Вынести мусор, проверить холодильники", "", 5),
-        ("closing", "Выключить оборудование, закрыть бар", "Свет, музыка, вентиляция, замки", 6),
-    ]
-    for section, title, detail, sort_order in tasks:
-        conn.execute(
-            "INSERT INTO checklist_templates (section, title, detail, sort_order) VALUES (?, ?, ?, ?)",
-            (section, title, detail, sort_order),
-        )
-    conn.commit()
-    print("✅ Чек-лист создан (17 пунктов)")
-
-
-def _init_events(conn):
-    demo = [
-        ("2026-03-28", "20:00", "DJ Masha On The Rocks", "Funk, soul и disco classics. Виниловый сет за барной стойкой.", "Funk / Soul / Disco", "300₽"),
-        ("2026-03-29", "19:00", "Квиз «Свои»", "Командная викторина о коктейлях и музыке. Призы — сертификаты бара.", "Quiz Night", ""),
-        ("2026-04-02", "21:00", "Blues Brothers Tribute", "Кавер-группа — лучшие хиты легендарного фильма вживую.", "Blues / R&B", "600₽"),
-        ("2026-04-05", "20:00", "Bossa Nova вечер", "Бразильская классика: гитара и вокал. Специальное коктейльное меню.", "Bossa Nova", ""),
-        ("2026-04-02", "21:00", "Jazz Quartet «Четверг»", "Живой джаз. Классика и авторские композиции.", "Jazz", "500₽"),
-        ("2026-03-31", "15:00", "Дегустация нового меню", "Пробуем новые коктейли перед запуском весеннего меню.", "Дегустация", ""),
-        ("2026-04-01", "09:00", "Тренинг по сервису", "Мастер-класс по работе с гостями. 2 часа.", "Обучение", ""),
-    ]
-    for d, t, title, desc, genre, fee in demo:
-        conn.execute(
-            "INSERT INTO events (event_date, event_time, title, description, genre, entry_fee) VALUES (?, ?, ?, ?, ?, ?)",
-            (d, t, title, desc, genre, fee),
-        )
-    conn.commit()
-    print("✅ Демо-события созданы")
-

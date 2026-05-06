@@ -20,7 +20,9 @@ def verify_password(password: str, password_hash: str) -> bool:
 
 def create_token(user_id: int) -> str:
     expire = datetime.now(timezone.utc) + timedelta(days=TOKEN_EXPIRE_DAYS)
-    return jwt.encode({"user_id": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM)
+    return jwt.encode(
+        {"user_id": user_id, "exp": expire}, SECRET_KEY, algorithm=ALGORITHM
+    )
 
 
 def verify_token(token: str) -> dict | None:
@@ -45,7 +47,9 @@ def get_current_user(token: str) -> dict | None:
     return None
 
 
-def register_user(username: str, display_name: str, password: str, role: str = "bartender") -> dict:
+def register_user(
+    username: str, display_name: str, password: str, role: str = "bartender"
+) -> dict:
     if role not in VALID_ROLES:
         role = "bartender"
 
@@ -63,7 +67,12 @@ def register_user(username: str, display_name: str, password: str, role: str = "
     user_id = cursor.lastrowid
     conn.close()
 
-    return {"user_id": user_id, "token": create_token(user_id), "display_name": display_name, "role": role}
+    return {
+        "user_id": user_id,
+        "token": create_token(user_id),
+        "display_name": display_name,
+        "role": role,
+    }
 
 
 def login_user(username: str, password: str) -> dict:
@@ -81,4 +90,9 @@ def login_user(username: str, password: str) -> dict:
     if not verify_password(password, user["password_hash"]):
         return {"error": "Неверный логин или пароль"}
 
-    return {"user_id": user["id"], "token": create_token(user["id"]), "display_name": user["display_name"], "role": user["role"]}
+    return {
+        "user_id": user["id"],
+        "token": create_token(user["id"]),
+        "display_name": user["display_name"],
+        "role": user["role"],
+    }
